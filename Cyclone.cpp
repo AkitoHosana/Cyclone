@@ -830,8 +830,6 @@ Int minKey, maxKey;
     // Local count
     unsigned long long localComparedCount = 0ULL;
 
-    //SIMD comparison
-    const __m256i target32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(targetHash160.data()));
 
     // Main processing loop
     while (!matchFound) {
@@ -937,13 +935,10 @@ Int minKey, maxKey;
                         computeHash160BatchBinSingle(localBatchCount, localPubKeys, localHashResults);
                         // Results check
                         for (int j = 0; j < HASH_BATCH_SIZE; j++) {
-                            __m256i cand32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(localHashResults[j]));
-                            __m256i cmp32 = _mm256_cmpeq_epi8(cand32, target32);
-                            int mask32 = _mm256_movemask_epi8(cmp32);
-                            // Use the g_prefixLength variable for comparison
-                            if ((mask32 & ((1 << g_prefixLength) - 1)) == ((1 << g_prefixLength) - 1)) {
-                                // If the first g_prefixLength bytes match, perform a memcmp to be sure
-                                if (!matchFound && std::memcmp(localHashResults[j], targetHash160.data(), g_prefixLength) == 0) {
+                            // Compare only the valid 20-byte Hash160 buffers. The previous
+                            // AVX2 loads read 32 bytes from 20-byte arrays (out of bounds).
+                            if (!matchFound && std::memcmp(localHashResults[j], targetHash160.data(), g_prefixLength) == 0) {
+                                bool fullMatch = false;
                                     #pragma omp critical
                                     {
                                         if (!matchFound) {
@@ -977,6 +972,7 @@ Int minKey, maxKey;
                                             }
                                             if (bytesMatch) {
                                                 matchFound = true;
+                                                fullMatch = true;
                                             } else {
                                                 matchFound = false;
                                                 // Print the partial match information
@@ -1035,12 +1031,13 @@ Int minKey, maxKey;
 
                                         }
                                     }
-                                    #pragma omp cancel parallel
+                                    // A prefix match is only diagnostic; keep searching.
+                                    // Stop all workers only after the complete Hash160 matches.
+                                    if (fullMatch) {
+                                        #pragma omp cancel parallel
+                                    }
                                 }
-                                localComparedCount++;
-                            } else {
-                                localComparedCount++;
-                            }
+                            localComparedCount++;
                         }
                         localBatchCount = 0;
                     }
