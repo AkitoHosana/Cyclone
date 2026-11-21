@@ -240,19 +240,18 @@ std::string pointToCompressedHex(const Point &point) {
     return (isEven(point.y) ? "02" : "03") + intXToHex64(point.x);
 }
 
-void pointToCompressedBin(const Point &point, uint8_t outCompressed[33]) {
-    outCompressed[0] = isEven(point.y) ? 0x02 : 0x03;
+void intToXBin(const Int &x, uint8_t outX[32]) {
     Int temp;
-    temp.Set((Int*)&point.x);
+    temp.Set((Int*)&x);
     for (int i = 0; i < 32; i++) {
-        outCompressed[1 + i] = (uint8_t)temp.GetByte(31 - i);
+        outX[i] = (uint8_t)temp.GetByte(31 - i);
     }
 }
 
 void printUsage(const char *programName) {
-    std::cerr << "Usage: " << programName << " -k <public_key_hex> [-p <puzzle> | -r <startHex:endHex>] -b <prefix_length> [-t <threads>]\n";
-    std::cerr << "  -k : Target compressed public key (66 hex chars)\n";
-    std::cerr << "  -b : Number of prefix bytes to compare (1-33)\n";
+    std::cerr << "Usage: " << programName << " -k <compressed_public_key_hex> [-p <puzzle> | -r <startHex:endHex>] -b <x_prefix_bytes> [-t <threads>]\n";
+    std::cerr << "  -k : Target compressed public key (66 hex chars); matching uses its x coordinate\n";
+    std::cerr << "  -b : Number of x-coordinate prefix bytes to compare (1-32)\n";
     std::cerr << "  -t : Number of CPU threads to use (default: all available cores)\n";
 }
 
@@ -361,7 +360,7 @@ void printStatsBlock(int numCPUs, const std::string &targetPublicKeyHex,
     std::cout << "================= WORK IN PROGRESS =================\n";
     std::cout << "Puzzle/Bits   : " << puzzle << "\n";
     std::cout << "Target PubKey : " << targetPublicKeyHex.substr(0, 16) << "..." << targetPublicKeyHex.substr(58) << "\n";
-    std::cout << "Prefix length : " << g_prefixLength << " bytes" << "\n";
+    std::cout << "X prefix length: " << g_prefixLength << " bytes" << "\n";
     std::cout << "Mode          : Random\n";
     std::cout << "CPU Threads   : " << numCPUs << "\n";
     std::cout << "Mkeys/s       : " << std::fixed << std::setprecision(2) << mkeysPerSec << "\n";
@@ -414,8 +413,8 @@ int main(int argc, char *argv[]) {
             puzzle = calculatePuzzleSize(rangeStartHex, rangeEndHex);
         } else if (!std::strcmp(argv[i], "-b") && i + 1 < argc) {
             g_prefixLength = std::stoi(argv[++i]);
-            if (g_prefixLength <= 0 || g_prefixLength > 33) {
-                std::cerr << "Invalid prefix length. Must be between 1 and 33.\n";
+            if (g_prefixLength <= 0 || g_prefixLength > 32) {
+                std::cerr << "Invalid x-coordinate prefix length. Must be between 1 and 32.\n";
                 return 1;
             }
         } else if (!std::strcmp(argv[i], "-t") && i + 1 < argc) {
@@ -549,7 +548,7 @@ int main(int argc, char *argv[]) {
         std::vector<Int> pointBatchX(fullBatchSize);
         std::vector<Int> pointBatchY(fullBatchSize);
 
-        alignas(32) uint8_t localPubKeys[fullBatchSize][33];
+        alignas(32) uint8_t localXCoords[fullBatchSize][32];
         int localBatchCount = 0;
         int pointIndices[fullBatchSize];
 
@@ -626,11 +625,8 @@ int main(int argc, char *argv[]) {
             }
 
             for (int i = 0; i < fullBatchSize; i++) {
-                Point tempPoint;
-                tempPoint.x.Set(&pointBatchX[i]);
-                tempPoint.y.Set(&pointBatchY[i]);
-
-                pointToCompressedBin(tempPoint, localPubKeys[localBatchCount]);
+                // The search target is x-only; avoid serializing y parity for every point.
+                intToXBin(pointBatchX[i], localXCoords[localBatchCount]);
                 pointIndices[localBatchCount] = i;
                 localBatchCount++;
 
@@ -638,13 +634,14 @@ int main(int argc, char *argv[]) {
                     for (int j = 0; j < fullBatchSize; j++) {
                         bool match = true;
                         for (int b = 0; b < g_prefixLength; b++) {
-                            if (localPubKeys[j][b] != targetPublicKey[b]) {
+                            if (localXCoords[j][b] != targetPublicKey[b + 1]) {
                                 match = false;
                                 break;
                             }
                         }
 
                     if (match) {
+                        bool fullXMatch = false;
                         #pragma omp critical
                         {
                             if (!matchFound) {
@@ -668,15 +665,10 @@ int main(int argc, char *argv[]) {
                                 matchedPoint.y.Set(&pointBatchY[idx]);
                                 foundPublicKeyHex = pointToCompressedHex(matchedPoint);
 
-                                bool fullMatch = true;
-                                for (int b = 0; b < 33; b++) {
-                                    if (localPubKeys[j][b] != targetPublicKey[b]) {
-                                        fullMatch = false;
-                                        break;
-                                    }
-                                }
+                                fullXMatch = std::memcmp(
+                                    localXCoords[j], targetPublicKey.data() + 1, 32) == 0;
 
-                                if (fullMatch) {
+                                if (fullXMatch) {
                                     matchFound = true;
                                 } else {
                                     std::lock_guard<std::mutex> lock(coutMutex);
@@ -686,15 +678,11 @@ int main(int argc, char *argv[]) {
                                     std::cout << "Prefix length : " << g_prefixLength << " bytes" << "\n";
                                     std::cout << "Private Key   : " << foundPrivateKeyHex << "\n";
                                     std::cout << "Public Key    : " << foundPublicKeyHex << "\n";
-                                    std::cout << "Found PubKey  : ";
-                                    for (int b = 0; b < 33; b++) {
-                                        printf("%02x", localPubKeys[j][b]);
-                                    }
-                                    std::cout << "\n";
+                                    std::cout << "Found PubKey  : " << foundPublicKeyHex << "\n";
                                     std::cout << "Target PubKey : " << targetPublicKeyHex << "\n";
                                     std::cout << "Matched bytes : ";
                                     for (int b = 0; b < g_prefixLength; b++) {
-                                        printf("%02x", targetPublicKey[b]);
+                                        printf("%02x", targetPublicKey[b + 1]);
                                     }
                                     std::cout << std::endl;
 
@@ -704,24 +692,21 @@ int main(int argc, char *argv[]) {
                                         partialFile << "Prefix length : " << g_prefixLength << " bytes" << "\n";
                                         partialFile << "Private Key   : " << foundPrivateKeyHex << "\n";
                                         partialFile << "Public Key    : " << foundPublicKeyHex << "\n";
-                                        partialFile << "Found PubKey  : ";
-                                        for (int b = 0; b < 33; b++) {
-                                            partialFile << std::setw(2) << std::setfill('0') << std::hex 
-                                                        << static_cast<unsigned int>(localPubKeys[j][b]);
-                                        }
-                                        partialFile << "\n";
+                                        partialFile << "Found PubKey  : " << foundPublicKeyHex << "\n";
                                         partialFile << "Target PubKey : " << targetPublicKeyHex << "\n";
                                         partialFile << "Matched bytes : ";
                                         for (int b = 0; b < g_prefixLength; b++) {
                                             partialFile << std::setw(2) << std::setfill('0') << std::hex 
-                                                        << static_cast<unsigned int>(targetPublicKey[b]);
+                                                        << static_cast<unsigned int>(targetPublicKey[b + 1]);
                                         }
                                         partialFile << std::endl;
                                     }
                                 }
                             }
                         }
-                        #pragma omp cancel parallel
+                        if (fullXMatch) {
+                            #pragma omp cancel parallel
+                        }
                     }
                     localComparedCount++;
                 }
